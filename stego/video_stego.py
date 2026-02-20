@@ -15,10 +15,9 @@ def generate_key_from_password(password: str) -> bytes:
 
 def hide_message_in_video(video_path: str, message: str, key: str, output_path: str):
     """
-    Hide encrypted message in first 100 frames of video using image steganography
-    REAL IMPLEMENTATION - Processes actual video frames
+    Hide encrypted message in first 100 frames of video using LSB steganography
     """
-    import cv2  # OpenCV for video processing
+    import cv2
     
     # Generate encryption key
     fernet_key = generate_key_from_password(key)
@@ -27,7 +26,11 @@ def hide_message_in_video(video_path: str, message: str, key: str, output_path: 
     # Encrypt message
     encrypted = cipher.encrypt(message.encode())
     data = base64.b64encode(encrypted).decode() + "|||VIDEO_END|||"
-    binary_data = ''.join(format(ord(c), '08b') for c in data)
+    
+    # Convert string to binary - properly handle each character's bytes
+    binary_data = ''
+    for char in data:
+        binary_data += format(ord(char), '08b')
     
     # Open video
     cap = cv2.VideoCapture(video_path)
@@ -36,9 +39,21 @@ def hide_message_in_video(video_path: str, message: str, key: str, output_path: 
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # Video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    # Video writer (lossless preferred)
+    ext = Path(output_path).suffix.lower()
+    if ext == ".avi":
+        fourcc = cv2.VideoWriter_fourcc(*'FFV1')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        if not out.isOpened():
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    if not out.isOpened():
+        cap.release()
+        raise ValueError("Failed to create output video. Try saving as .avi (lossless).")
     
     frame_count = 0
     data_index = 0
@@ -52,41 +67,44 @@ def hide_message_in_video(video_path: str, message: str, key: str, output_path: 
             
         frame_count += 1
         
-        # Convert frame to PIL Image for steganography
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(frame_rgb)
-        
         # Embed data in first 100 frames only
         if frame_count <= 100 and data_index < len(binary_data):
-            pixels = list(pil_image.getdata())
+            # Work directly with numpy array (BGR format from OpenCV)
+            pixels = frame.astype(np.uint8)
             
-            new_pixels = []
-            for i, (r, g, b) in enumerate(pixels):
-                if data_index < len(binary_data):
-                    r = (r & 0xFE) | int(binary_data[data_index])
-                    data_index += 1
-                if data_index < len(binary_data):
-                    g = (g & 0xFE) | int(binary_data[data_index])
-                    data_index += 1
-                if data_index < len(binary_data):
-                    b = (b & 0xFE) | int(binary_data[data_index])
-                    data_index += 1
-                new_pixels.append((r, g, b))
-                
-                # Check if data fully embedded
-                if data_index >= len(binary_data):
-                    break
+            # Flatten and embed
+            flat_pixels = pixels.flatten()
             
-            # Rebuild frame
-            stego_frame = Image.new('RGB', pil_image.size)
-            stego_frame.putdata(new_pixels[:len(pixels)])
-            frame = cv2.cvtColor(np.array(stego_frame), cv2.COLOR_RGB2BGR)
+            # Embed bits into LSB of each color channel
+            max_bits = len(flat_pixels)
+            bits_to_embed = min(len(binary_data) - data_index, max_bits)
+            
+            for i in range(bits_to_embed):
+                # Clear LSB and set new bit
+                flat_pixels[i] = (flat_pixels[i] & 0xFE) | int(binary_data[data_index + i])
+            
+            data_index += bits_to_embed
+            
+            # Reshape back and convert to BGR
+            stego_frame = flat_pixels.reshape(pixels.shape)
+            frame = stego_frame.astype(np.uint8)
         
         out.write(frame)
         
         # Progress
         if frame_count % 30 == 0:
             print(f"Processed {frame_count}/{total_frames} frames...")
+        
+        # Stop if all data embedded
+        if data_index >= len(binary_data):
+            # Write remaining frames without modification
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_count += 1
+                out.write(frame)
+            break
     
     cap.release()
     out.release()
@@ -98,14 +116,15 @@ def hide_message_in_video(video_path: str, message: str, key: str, output_path: 
 def extract_message_from_video(video_path: str, key: str) -> str:
     """Extract message from video frames"""
     import cv2
-    import numpy as np
     
     fernet_key = generate_key_from_password(key)
     cipher = Fernet(fernet_key)
     
     cap = cv2.VideoCapture(video_path)
     
-    binary_data = ""
+    marker = "|||VIDEO_END|||"
+    bit_buffer = ""
+    char_buffer = []
     frame_count = 0
     
     print("Extracting from first 100 frames...")
@@ -117,34 +136,51 @@ def extract_message_from_video(video_path: str, key: str) -> str:
             
         frame_count += 1
         
-        # Convert to PIL for pixel access
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(frame_rgb)
-        pixels = list(pil_image.getdata())
-        
         # Extract LSB from each pixel
-        for r, g, b in pixels[:1000]:  # Limit per frame
-            binary_data += str(r & 1) + str(g & 1) + str(b & 1)
-            
-            # Convert 8 bits to char and check for end marker
-            if len(binary_data) % 8 == 0:
-                chunk = binary_data[-8:]
-                char = chr(int(chunk, 2))
-                if "|||VIDEO_END|||" in char * (len(binary_data) // 8 % 12):
-                    break
+        flat_pixels = frame.flatten()
         
-        print(f"Frame {frame_count}: {len(binary_data)//8} chars extracted...")
+        for val in flat_pixels:
+            bit_buffer += str(val & 1)
+            
+            # Process complete bytes
+            while len(bit_buffer) >= 8:
+                byte = bit_buffer[:8]
+                bit_buffer = bit_buffer[8:]
+                try:
+                    char = chr(int(byte, 2))
+                    char_buffer.append(char)
+                except:
+                    char_buffer.append('?')
+                
+                # Check for marker
+                if len(char_buffer) >= len(marker):
+                    if ''.join(char_buffer[-len(marker):]) == marker:
+                        cap.release()
+                        data = ''.join(char_buffer)
+                        encrypted_b64 = data.split(marker)[0]
+                        try:
+                            encrypted = base64.b64decode(encrypted_b64)
+                            decrypted = cipher.decrypt(encrypted).decode()
+                            return decrypted
+                        except Exception as e:
+                            raise ValueError(f"Decryption failed: {e}")
+        
+        print(f"Frame {frame_count}: {len(char_buffer)} chars extracted...")
     
     cap.release()
     
-    # Convert binary to text
-    chars = [binary_data[i:i+8] for i in range(0, len(binary_data), 8)]
-    data = ''.join(chr(int(c, 2)) for c in chars if len(c) == 8)
+    # Try to debug - show what we got
+    if char_buffer:
+        print(f"Extracted {len(char_buffer)} chars, marker not found")
+        print(f"First 100 chars: {''.join(char_buffer[:100])}")
     
-    if "|||VIDEO_END|||" in data:
-        encrypted_b64 = data.split("|||VIDEO_END|||")[0]
-        encrypted = base64.b64decode(encrypted_b64)
-        decrypted = cipher.decrypt(encrypted).decode()
-        return decrypted
-    else:
-        raise ValueError("No message found or wrong key!")
+    raise ValueError("No message found or wrong key!")
+
+# Aliases for compatibility with UI modules
+def hide_video_message(video_path: str, message: str, key: str, output_path: str):
+    """Alias for hide_message_in_video"""
+    return hide_message_in_video(video_path, message, key, output_path)
+
+def extract_video_message(video_path: str, key: str) -> str:
+    """Alias for extract_message_from_video"""
+    return extract_message_from_video(video_path, key)

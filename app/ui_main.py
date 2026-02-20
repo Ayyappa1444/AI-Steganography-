@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QLabel, QPushButton,
                             QTextEdit, QLineEdit, QFileDialog, QVBoxLayout, QHBoxLayout, 
                             QMessageBox, QStackedWidget, QFrame, QSpacerItem, QSizePolicy,
                             QComboBox, QScrollArea)
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QImage
 from PyQt6.QtCore import Qt
 import os
 import numpy as np
@@ -40,7 +40,7 @@ class MainUI(QMainWindow):
     def __init__(self, username=None):
         super().__init__()
         self.username = username or "User"
-        self.setWindowTitle("🎨 AI Steganography Suite v2.0")
+        self.setWindowTitle("AI Steganography Suite v2.0")
         self.setFixedSize(1200, 800)
         self.image_path = None
         self.video_path = None
@@ -152,7 +152,7 @@ class MainUI(QMainWindow):
         header_layout.setContentsMargins(10, 5, 10, 5)
         
         # App title on the left
-        app_title = QLabel("🎨 AI Steganography Suite")
+        app_title = QLabel("AI Steganography Suite")
         app_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #3b82f6;")
         header_layout.addWidget(app_title)
         
@@ -469,16 +469,20 @@ class MainUI(QMainWindow):
             img = Image.open(image_path).convert('RGB')
             pixels = np.array(img)
             
+            # Read ALL pixels from the red channel
             binary_data = ''
-            for y in range(min(100, pixels.shape[0])):
+            for y in range(pixels.shape[0]):
                 for x in range(pixels.shape[1]):
                     binary_data += str(pixels[y, x, 0] & 1)
-                    if len(binary_data) > 200:
-                        break
-                if len(binary_data) > 200:
-                    break
             
+            # First 32 bits = message length
             msg_len = int(binary_data[:32], 2)
+            
+            # Check if message length is reasonable (max 1MB)
+            if msg_len <= 0 or msg_len > 1000000:
+                return "No message found"
+            
+            # Extract the message bits
             msg_binary = binary_data[32:32 + msg_len * 8]
             
             key_bytes = key.encode('utf-8')
@@ -488,37 +492,14 @@ class MainUI(QMainWindow):
                     byte_val = int(msg_binary[i:i+8], 2)
                     decrypted.append(byte_val ^ key_bytes[i//8 % len(key_bytes)])
             
-            return decrypted.decode('utf-8', errors='ignore').rstrip('\x00')
-        except:
+            # Check for end marker (4 bytes of 0xFF)
+            result = decrypted.decode('utf-8', errors='ignore')
+            if '\xFF\xFF\xFF\xFF' in result:
+                result = result.split('\xFF\xFF\xFF\xFF')[0]
+            
+            return result.rstrip('\x00')
+        except Exception as e:
             return "No message found"
-    
-    def hide_message_video(self, video_path, message, key, output_path):
-        try:
-            cap = cv2.VideoCapture(video_path)
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            w, h = int(cap.get(3)), int(cap.get(4))
-            out = cv2.VideoWriter(output_path, fourcc, 30.0, (w, h))
-            
-            msg_binary = ''.join(format(ord(c) ^ ord(key[i % len(key)]), '08b') for i, c in enumerate(message))
-            idx = 0
-            
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if idx < len(msg_binary):
-                    for y in range(min(50, frame.shape[0])):
-                        for x in range(min(50, frame.shape[1])):
-                            if idx < len(msg_binary):
-                                frame[y, x, 0] = (frame[y, x, 0] & 0xFE) | int(msg_binary[idx])
-                                idx += 1
-                out.write(frame)
-            
-            cap.release()
-            out.release()
-            return True
-        except:
-            return False
     
     def generate_heatmap(self, image_path):
         try:
@@ -741,32 +722,45 @@ class MainUI(QMainWindow):
         if file_path:
             self.video_path = file_path
             cap = cv2.VideoCapture(file_path)
-            ret, frame = cap.read()
-            if ret:
+            try:
+                ret, frame = cap.read()
+                if not ret:
+                    QMessageBox.critical(self, "Error", "Failed to read the video file.")
+                    return
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 height, width = frame_rgb.shape[:2]
+                if width == 0 or height == 0:
+                    QMessageBox.critical(self, "Error", "Invalid video frame size.")
+                    return
                 max_size = 470
-                scale = min(max_size/width, max_size/height)
+                scale = min(max_size / width, max_size / height)
                 new_w, new_h = int(width * scale), int(height * scale)
                 frame_resized = cv2.resize(frame_rgb, (new_w, new_h))
-                qimage = QPixmap.fromImage(frame_resized)
-                self.video_label.setPixmap(qimage)
-            cap.release()
-            self.video_label.setStyleSheet("QLabel { border: 3px solid #10b981; border-radius: 20px; background: black; }")
+                bytes_per_line = frame_resized.shape[1] * 3
+                qimage = QImage(frame_resized.data, frame_resized.shape[1], frame_resized.shape[0], bytes_per_line, QImage.Format.Format_RGB888)
+                self.video_label.setPixmap(QPixmap.fromImage(qimage))
+                self.video_label.setStyleSheet("QLabel { border: 3px solid #10b981; border-radius: 20px; background: black; }")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Video preview failed:\n\n{str(e)}")
+            finally:
+                cap.release()
     
     def hide_video_action(self):
         if not self.video_path:
             QMessageBox.warning(self, "Error", "Please upload a video!")
             return
         key = self.key_video.text() or "defaultkey"
-        output_path = QFileDialog.getSaveFileName(self, "Save Stego Video", "", "MP4 (*.mp4)")[0]
+        output_path = QFileDialog.getSaveFileName(self, "Save Stego Video", "", "AVI (lossless) (*.avi);;MP4 (*.mp4)")[0]
         if output_path:
-            if self.hide_message_video(self.video_path, self.msg_video.toPlainText(), key, output_path):
+            if output_path.lower().endswith(".mp4"):
+                QMessageBox.warning(self, "Warning", "MP4 is lossy and may corrupt hidden data. For reliable extraction, save as AVI.")
+            try:
+                hide_message_in_video(self.video_path, self.msg_video.toPlainText(), key, output_path)
                 QMessageBox.information(self, "Success", "Message hidden in video!")
                 self.msg_video.clear()
                 self.key_video.clear()
-            else:
-                QMessageBox.critical(self, "Error", "Failed to process video!")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to process video!\n\nError: {str(e)}")
     
     def extract_video_action(self):
         if not self.video_path:
@@ -800,6 +794,15 @@ class MainUI(QMainWindow):
         title = QLabel("🤖 AI Steganography Detection")
         title.setStyleSheet("font-size: 16px; font-weight: bold; color: #8b5cf6;")
         left_layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        media_label = QLabel("Select Media Type:", styleSheet="font-size: 11px; color: #94a3b8;")
+        left_layout.addWidget(media_label)
+        
+        self.media_type_combo = QComboBox()
+        self.media_type_combo.setFixedHeight(32)
+        self.media_type_combo.addItems(["Image", "Video"])
+        self.media_type_combo.setStyleSheet("background-color: #1e293b; color: white; border: 2px solid #8b5cf6; border-radius: 8px; padding: 5px;")
+        left_layout.addWidget(self.media_type_combo)
         
         task_label = QLabel("Select Analysis Task:", styleSheet="font-size: 11px; color: #94a3b8;")
         left_layout.addWidget(task_label)
@@ -958,33 +961,81 @@ class MainUI(QMainWindow):
         return page
     
     def upload_ai_image(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Image for Analysis", "", "Images (*.png *.jpg *.jpeg)")
-        if file_path:
-            self.ai_path = file_path
-            pixmap = QPixmap(file_path).scaled(470, 310, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            self.ai_label.setPixmap(pixmap)
-            self.ai_label.setStyleSheet("QLabel { border: 3px solid #8b5cf6; border-radius: 20px; background: black; }")
+        media_type = self.media_type_combo.currentText()
+        
+        if media_type == "Video":
+            # Handle video upload
+            file_path, _ = QFileDialog.getOpenFileName(self, "Select Video for Analysis", "", "Videos (*.mp4 *.avi *.mov)")
+            if file_path:
+                self.ai_path = file_path
+                # Get first frame as preview
+                cap = cv2.VideoCapture(file_path)
+                try:
+                    ret, frame = cap.read()
+                    if ret:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        height, width = frame_rgb.shape[:2]
+                        max_size = 320
+                        scale = min(max_size / width, max_size / height)
+                        new_w, new_h = int(width * scale), int(height * scale)
+                        frame_resized = cv2.resize(frame_rgb, (new_w, new_h))
+                        bytes_per_line = frame_resized.shape[1] * 3
+                        qimage = QImage(frame_resized.data, frame_resized.shape[1], frame_resized.shape[0], bytes_per_line, QImage.Format.Format_RGB888)
+                        self.ai_label.setPixmap(QPixmap.fromImage(qimage))
+                        self.ai_label.setText("")
+                        self.ai_label.setStyleSheet("QLabel { border: 3px solid #8b5cf6; border-radius: 10px; background: black; }")
+                finally:
+                    cap.release()
+        else:
+            # Handle image upload
+            file_path, _ = QFileDialog.getOpenFileName(self, "Select Image for Analysis", "", "Images (*.png *.jpg *.jpeg)")
+            if file_path:
+                self.ai_path = file_path
+                pixmap = QPixmap(file_path).scaled(320, 160, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                self.ai_label.setPixmap(pixmap)
+                self.ai_label.setText("")
+                self.ai_label.setStyleSheet("QLabel { border: 3px solid #8b5cf6; border-radius: 10px; background: black; }")
     
     def analyze_image_action(self):
         if not self.ai_path:
-            QMessageBox.warning(self, "Error", "Please upload an image first!")
+            QMessageBox.warning(self, "Error", "Please upload an image or video first!")
             return
         
-        heatmap_pixmap = self.generate_heatmap(self.ai_path)
+        media_type = self.media_type_combo.currentText()
+        
+        # For video, extract first frame for analysis
+        if media_type == "Video":
+            cap = cv2.VideoCapture(self.ai_path)
+            ret, frame = cap.read()
+            cap.release()
+            if ret:
+                # Save frame as temp image for analysis
+                temp_frame_path = "temp_video_frame.png"
+                cv2.imwrite(temp_frame_path, frame)
+                analysis_path = temp_frame_path
+            else:
+                QMessageBox.critical(self, "Error", "Failed to read video frame!")
+                return
+        else:
+            analysis_path = self.ai_path
+        
+        heatmap_pixmap = self.generate_heatmap(analysis_path)
         if heatmap_pixmap:
             scaled_heatmap = heatmap_pixmap.scaled(320, 140, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             self.heatmap_label.setPixmap(scaled_heatmap)
             self.tab_heatmap.setPixmap(heatmap_pixmap.scaled(450, 280, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         
-        result_text, color, confidence, details = self.analyze_cnn_with_details(self.ai_path)
+        result_text, color, confidence, details = self.analyze_cnn_with_details(analysis_path)
         
         self.result_label.setText(result_text)
         self.result_label.setStyleSheet(f"QLabel {{ font-size: 11px; font-weight: bold; padding: 8px; border-radius: 8px; background: {color}; color: white; }}")
         
+        # Fixed: Use RichText format for HTML content
         self.tab_result.setText(result_text + "\n\n" + details)
+        self.tab_result.setTextFormat(Qt.TextFormat.RichText)
         self.tab_result.setStyleSheet(f"QLabel {{ font-size: 14px; font-weight: bold; padding: 20px; border-radius: 10px; background: #0f172a; color: white; line-height: 1.6; }}")
         
-        self.generate_analysis_graphs(self.ai_path, confidence)
+        self.generate_analysis_graphs(analysis_path, confidence)
     
     def generate_analysis_graphs(self, image_path, confidence):
         try:
@@ -1087,12 +1138,14 @@ class MainUI(QMainWindow):
         title.setStyleSheet("font-size: 24px; font-weight: bold; color: #3b82f6; margin: 15px;")
         layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
         
-        # Sections...
+        # Abstract Section
         abstract = QLabel("""
         <div style='background: #1e293b; padding: 20px; border-radius: 12px; font-size: 14px; line-height: 1.8; color: #e2e8f0;'>
         <h2 style='color: #10b981;'>📝 Abstract</h2>
         <p>This project presents a comprehensive <b>AI Steganography Suite</b> - a modern desktop application that combines 
         <b>steganography</b> (the art of hiding data within other data) with <b>steganalysis</b> (detecting hidden data).</p>
+        <p>The application provides a graphical interface for hiding secret messages in images and videos, as well as 
+        using AI-powered detection to analyze images for potential steganographic content.</p>
         <p><b>Key Features:</b></p>
         <ul>
         <li>🖼️ Image Steganography with LSB embedding</li>
@@ -1106,23 +1159,62 @@ class MainUI(QMainWindow):
         abstract.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(abstract)
         
+        # Technical Details Section
+        technical = QLabel("""
+        <div style='background: #1e293b; padding: 20px; border-radius: 12px; font-size: 14px; line-height: 1.8; color: #e2e8f0;'>
+        <h2 style='color: #10b981;'>🔬 Technical Implementation</h2>
+        
+        <h3 style='color: #60a5fa;'>Image Steganography (LSB)</h3>
+        <p>The application uses <b>Least Significant Bit (LSB)</b> steganography to embed secret data within the 
+        least significant bits of pixel values. The encryption process involves:</p>
+        <ul>
+        <li>XOR-based encryption using a user-provided key</li>
+        <li>Message length encoding (4 bytes)</li>
+        <li>End marker (\\xFF\\xFF\\xFF\\xFF) for extraction</li>
+        <li>LSB modification in the red channel</li>
+        </ul>
+        
+        <h3 style='color: #60a5fa;'>Video Steganography</h3>
+        <p>Video steganography extends image steganography across multiple frames:</p>
+        <ul>
+        <li>Fernet encryption for secure message encoding</li>
+        <li>Base64 encoding for data transformation</li>
+        <li>LSB embedding across first 100 frames</li>
+        <li>End marker for extraction detection</li>
+        </ul>
+        
+        <h3 style='color: #60a5fa;'>AI Steganalysis</h3>
+        <p>The AI detection module uses statistical analysis:</p>
+        <ul>
+        <li>LSB distribution analysis</li>
+        <li>Pixel value statistics (mean, std dev)</li>
+        <li>Balance score calculation</li>
+        <li>Confidence-based detection</li>
+        </ul>
+        </div>
+        """)
+        technical.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(technical)
+        
+        # How to Use Section
         howto = QLabel("""
-        <div style='background: #1e293b; padding: 15px; border-radius: 10px; font-size: 13px; line-height: 1.6; color: #e2e8f0;'>
+        <div style='background: #1e293b; padding: 20px; border-radius: 12px; font-size: 14px; line-height: 1.8; color: #e2e8f0;'>
         <h2 style='color: #10b981;'>📖 How to Use</h2>
-        <b>🖼️ Image Steganography:</b><br>
+        
+        <h3 style='color: #60a5fa;'>🖼️ Image Steganography:</h3>
         1. Click "Upload" to select an image (PNG, JPG, BMP)<br>
         2. Enter your secret message in the text box<br>
         3. Set a secure key/password<br>
         4. Click "🔒 ENCRYPT & HIDE" button<br>
         5. Save the stego image to your desired location<br><br>
         
-        <b>🎥 Video Steganography:</b><br>
+        <h3 style='color: #60a5fa;'>🎥 Video Steganography:</h3>
         1. Click "Upload Video" to select a video file<br>
         2. Enter message and key/password<br>
         3. Click "🔒 ENCRYPT & HIDE" to embed<br>
-        4. Save the stego video<br><br>
+        4. Save the stego video (AVI recommended for lossless)<br><br>
         
-        <b>🤖 AI Detection:</b><br>
+        <h3 style='color: #60a5fa;'>🤖 AI Detection:</h3>
         1. Navigate to AI Detection page from sidebar<br>
         2. Select analysis task from dropdown menu<br>
         3. Upload image to analyze<br>
